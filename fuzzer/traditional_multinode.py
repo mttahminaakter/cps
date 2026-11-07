@@ -1,14 +1,18 @@
 
-"""Traditional (non-adaptive) multi-node CPS dam fuzzing campaign.
+"""Traditional, non-adaptive multi-node CPS dam fuzzer.
 
-Run on macOS in ~/cps, with the existing Docker Compose lab running:
+Run:
     python3 fuzzer/traditional_multinode.py --per-node 40 --seed 42
 
-The Modbus worker runs inside the EXISTING attacker container; the HMI is
-probed through the host's existing 127.0.0.1:8080 forwarding. Default
-campaigns are READ-ONLY. An explicit flag enables a few bounded FC06 tests.
+Tests:
+- Reservoir and inlet Modbus TCP
+- HMI HTTP interface
+- OpenPLC and system health
+- Automatic recovery
+- Before-and-after cross-node measurements
 
-Requires Python 3.9+ and Docker Compose. No third-party Python packages.
+Default Modbus tests are read-only.
+Requires the existing Docker Compose lab.
 """
 
 import argparse
@@ -28,16 +32,19 @@ import time
 
 
 LAB_SERVICES = ("attacker", "device", "inlet", "openplc", "hmi")
-
 HMI_HOST, HMI_PORT = "127.0.0.1", 8080
 
 COLUMNS = (
-    "timestamp_utc", "phase", "target", "protocol", "case_id", "family",
-    "function", "address", "quantity", "value", "result", "exception_code",
-    "exception_name", "latency_ms", "http_status", "detail",
-    "request_hex", "response_hex", "water_level_pct", "gate_actual_pct",
-    "inlet_actual_pct", "inlet_inflow_milli", "plc_running", "hmi_online",
-    "plc_scan_counter", "plc_telemetry_age_s", "review_flags",
+    "timestamp_utc", "phase", "target", "protocol",
+    "case_id", "family", "function", "address",
+    "quantity", "value", "result", "exception_code",
+    "exception_name", "latency_ms", "http_status",
+    "detail", "request_hex", "response_hex",
+    "water_level_pct", "gate_actual_pct",
+    "inlet_actual_pct", "inlet_inflow_milli",
+    "plc_running", "hmi_online",
+    "plc_scan_counter", "plc_telemetry_age_s",
+    "review_flags",
 )
 
 
@@ -46,10 +53,13 @@ def utc_now():
 
 
 def compose_running():
-    """Return the running Compose services, not just reachable TCP ports."""
+    """Return running Docker Compose services."""
     try:
         result = subprocess.run(
-            ["docker", "compose", "ps", "--status", "running", "--services"],
+            [
+                "docker", "compose", "ps",
+                "--status", "running", "--services"
+            ],
             capture_output=True,
             text=True,
             timeout=10,
@@ -61,7 +71,7 @@ def compose_running():
 
 
 def compose_restart_count(service):
-    """Docker's persistent restart count, or None if unavailable."""
+    """Get the number of container restarts."""
     try:
         ps = subprocess.run(
             ["docker", "compose", "ps", "-q", service],
@@ -77,7 +87,10 @@ def compose_restart_count(service):
             return None
 
         result = subprocess.run(
-            ["docker", "inspect", "-f", "{{.RestartCount}}", container_id],
+            [
+                "docker", "inspect", "-f",
+                "{{.RestartCount}}", container_id
+            ],
             capture_output=True,
             text=True,
             timeout=10,
@@ -91,7 +104,7 @@ def compose_restart_count(service):
 
 
 class ModbusWorker:
-    """One persistent Docker exec, not a costly Docker exec per testcase."""
+    """Communicate through the existing attacker container."""
 
     def __init__(self):
         self.proc = None
@@ -133,23 +146,27 @@ class ModbusWorker:
             )
 
             raise RuntimeError(
-                "Docker worker terminated unexpectedly: " + error[:600]
+                "Docker worker terminated unexpectedly: "
+                + error[:600]
             )
 
         return json.loads(line)
 
     def request(self, operation, **kwargs):
         self.proc.stdin.write(
-            json.dumps({"operation": operation, **kwargs}) + "\n"
+            json.dumps({
+                "operation": operation,
+                **kwargs
+            }) + "\n"
         )
 
         self.proc.stdin.flush()
-
         response = self._read()
 
         if response.get("event") == "error":
             raise RuntimeError(
-                "Modbus worker error: %s" % response.get("error")
+                "Modbus worker error: %s"
+                % response.get("error")
             )
 
         return response
@@ -178,7 +195,7 @@ class ModbusWorker:
 
 
 def read_hmi(path):
-    """Only safe, bounded GET requests to the existing localhost-only HMI."""
+    """Send bounded HTTP GET requests to the local HMI."""
 
     if (
         not path.startswith("/")
@@ -241,7 +258,7 @@ def read_hmi(path):
 
 
 def discover_hmi_paths(repo_root):
-    """Find candidate read-only API paths in the user's real HMI source."""
+    """Discover candidate read-only HMI endpoints."""
 
     candidates = set()
     directory = repo_root / "services" / "hmi"
@@ -296,7 +313,7 @@ def discover_hmi_paths(repo_root):
 
 
 def modbus_cases(name, total, rng):
-    """Fixed boundary corpus plus seeded mutations; NO feedback/adaptation."""
+    """Generate fixed boundary cases and seeded random cases."""
 
     fixed = [
         ("valid_two_registers", 4, 0, 2, {}),
@@ -350,6 +367,8 @@ def modbus_cases(name, total, rng):
 
 
 def hmi_cases(paths):
+    """Generate HTTP requests for the HMI."""
+
     tests = [
         ("root_valid", "/", "baseline"),
         ("empty_query", "/?probe=", "http_query"),
@@ -379,6 +398,8 @@ def hmi_cases(paths):
 
 
 def expected_commands(level):
+    """Expected controller commands for each water level."""
+
     if level > 90:
         return 100, 0
 
@@ -392,33 +413,24 @@ def expected_commands(level):
 
 
 def extract_json_fields(data):
-    """Best-effort HMI JSON extraction, never assume one unverified schema."""
+    """Extract useful HMI fields when available."""
 
     candidate_keys = {
         "water_level_pct": (
-            "water_level",
-            "water_level_pct",
-            "reported_level",
-            "reservoir_level"
+            "water_level", "water_level_pct",
+            "reported_level", "reservoir_level"
         ),
         "gate_actual_pct": (
-            "actual_gate",
-            "gate_actual",
-            "gate_position"
+            "actual_gate", "gate_actual", "gate_position"
         ),
         "inlet_actual_pct": (
-            "inlet_actual",
-            "inlet_position",
-            "inlet_valve"
+            "inlet_actual", "inlet_position", "inlet_valve"
         ),
         "plc_scan_counter": (
-            "scan_counter",
-            "cycle_count",
-            "plc_scan_count"
+            "scan_counter", "cycle_count", "plc_scan_count"
         ),
         "plc_telemetry_age_s": (
-            "plc_age_seconds",
-            "plc_telemetry_age_s",
+            "plc_age_seconds", "plc_telemetry_age_s",
             "seconds_since_plc_update"
         ),
     }
@@ -449,12 +461,11 @@ def extract_json_fields(data):
                 visit(item, depth + 1)
 
     visit(data, 0)
-
     return found
 
 
 def candidate_hmi_json(paths):
-    """A real JSON API must be observed; a guessed route is never a source."""
+    """Verify that an HMI JSON endpoint actually responds."""
 
     for path in paths:
         result = read_hmi(path)
@@ -466,7 +477,6 @@ def candidate_hmi_json(paths):
             doc = json.loads(
                 result["body"].decode("utf-8")
             )
-
         except (ValueError, UnicodeDecodeError):
             continue
 
@@ -479,6 +489,8 @@ def candidate_hmi_json(paths):
 
 
 def flatten_snapshot(readings):
+    """Convert Modbus readings into physical-process values."""
+
     details = {}
     flags = []
 
@@ -548,6 +560,8 @@ def flatten_snapshot(readings):
 
 
 def record_csv(writer, **data):
+    """Save one experiment observation."""
+
     row = {
         key: ""
         for key in COLUMNS
@@ -568,6 +582,8 @@ def record_csv(writer, **data):
 
 
 def run_campaign(args):
+    """Run the complete traditional fuzzing campaign."""
+
     repo_root = Path(__file__).resolve().parent.parent
 
     output_dir = (
@@ -609,7 +625,7 @@ def run_campaign(args):
 
     if read_hmi("/")["http_status"] != 200:
         raise RuntimeError(
-            "HMI must be available at http://127.0.0.1:8080 before fuzzing"
+            "HMI must be available at http://127.0.0.1:8080"
         )
 
     discovered = discover_hmi_paths(repo_root)
@@ -622,16 +638,17 @@ def run_campaign(args):
 
     print(
         "HMI API paths discovered:",
-        paths or "none (HTTP root and negative tests still work)"
+        paths or "none"
     )
 
     print(
         "HMI JSON status endpoint:",
-        hmi_api or "not verified; HMI-vs-Modbus values unavailable"
+        hmi_api or "not verified"
     )
 
     print(
-        "Starting traditional campaign; default requests do not change actuators."
+        "Starting traditional campaign; "
+        "default requests do not change actuators."
     )
 
     counters = Counter()
@@ -643,9 +660,8 @@ def run_campaign(args):
     last_snapshot = None
 
     consecutive_policy_mismatches = 0
-
     last_plc_scan = None
-    stalled_scan_samples = 0
+    unchanged_scan_since = None
 
     restart_before = {
         svc: compose_restart_count(svc)
@@ -669,18 +685,19 @@ def run_campaign(args):
         with ModbusWorker() as worker:
 
             def sample(label):
+                """Monitor the complete simulated system."""
+
                 nonlocal last_snapshot
                 nonlocal initial_snapshot
                 nonlocal consecutive_policy_mismatches
                 nonlocal last_plc_scan
-                nonlocal stalled_scan_samples
+                nonlocal unchanged_scan_since
 
                 raw = worker.request("snapshot")["readings"]
 
                 values, flags = flatten_snapshot(raw)
 
                 running_now = compose_running()
-
                 hmi = read_hmi("/")
 
                 if "openplc" not in running_now:
@@ -709,17 +726,20 @@ def run_campaign(args):
 
                         values["plc_scan_counter"] = scan
 
+                        now = time.monotonic()
+
                         if last_plc_scan == scan:
-                            stalled_scan_samples += 1
+                            if unchanged_scan_since is None:
+                                unchanged_scan_since = now
+
+                            if now - unchanged_scan_since >= 2.0:
+                                flags.append(
+                                    "plc_scan_counter_not_advancing"
+                                )
                         else:
-                            stalled_scan_samples = 0
+                            unchanged_scan_since = None
 
                         last_plc_scan = scan
-
-                        if stalled_scan_samples >= 2:
-                            flags.append(
-                                "plc_scan_counter_not_advancing"
-                            )
 
                     if "plc_telemetry_age_s" in api_values:
                         age = api_values[
@@ -744,7 +764,8 @@ def run_campaign(args):
                                 api_values[field] - values[field]
                             ) > tolerance:
                                 flags.append(
-                                    "hmi_modbus_difference_%s" % field
+                                    "hmi_modbus_difference_%s"
+                                    % field
                                 )
 
                 policy_difference = any(
@@ -806,19 +827,17 @@ def run_campaign(args):
 
                 return values
 
-            # --------------------------------------------
-            # NEW: AUTOMATIC CROSS-NODE RECOVERY TESTING
-            # --------------------------------------------
+            # ==========================================
+            # V2: AUTOMATIC RECOVERY TESTING
+            # ==========================================
 
             def check_recovery(origin, case_id, trigger):
-                """After an unusual response, check both devices and system health."""
+                """Verify that both devices answer valid requests."""
 
-                targets = (
+                for node in (
                     origin,
                     "device" if origin == "inlet" else "inlet"
-                )
-
-                for node in targets:
+                ):
                     started = time.monotonic()
                     reply = {}
 
@@ -875,9 +894,6 @@ def run_campaign(args):
                         protocol="modbus_tcp",
                         case_id="after_" + case_id,
                         family="cross_node_recovery",
-                        function=4,
-                        address=0,
-                        quantity=2,
                         result=outcome,
                         latency_ms=elapsed_ms,
                         detail=(
@@ -900,26 +916,87 @@ def run_campaign(args):
                     for flag in review:
                         flags_found[flag] += 1
 
-                # Check OpenPLC, HMI, and device consistency.
                 sample(
-                    "after_recovery_%s_%s" % (
-                        origin,
-                        case_id
+                    "after_recovery_%s_%s"
+                    % (origin, case_id)
+                )
+
+            # ==========================================
+            # V3B: BEFORE-AND-AFTER MEASUREMENTS
+            # ==========================================
+
+            def paired_measure(stage, origin, case_name):
+                """Measure both Modbus nodes and system status.
+
+                These probes are sequential, not simultaneous.
+                """
+
+                for node in ("inlet", "device"):
+                    reply = worker.request(
+                        "fuzz",
+                        case={
+                            "target": node,
+                            "function": 4,
+                            "address": 0,
+                            "quantity": 2,
+                        }
+                    )["data"]
+
+                    result = reply.get("result", "unknown")
+
+                    valid = result == "normal_response"
+
+                    review = (
+                        []
+                        if valid
+                        else ["paired_probe_failed_" + node]
+                    )
+
+                    record_csv(
+                        writer,
+                        phase="paired_probe",
+                        target=node,
+                        protocol="modbus_tcp",
+                        case_id="%s_%s_%s" % (
+                            stage, origin, case_name
+                        ),
+                        family="before_after",
+                        function=4,
+                        address=0,
+                        quantity=2,
+                        result=result,
+                        latency_ms=reply.get(
+                            "latency_ms", ""
+                        ),
+                        detail="stage=%s origin=%s" % (
+                            stage, origin
+                        ),
+                        review_flags=review
+                    )
+
+                    counters[(
+                        "paired_probe",
+                        stage + "_" + result
+                    )] += 1
+
+                    for flag in review:
+                        flags_found[flag] += 1
+
+                sample(
+                    "%s_%s_%s" % (
+                        stage, origin, case_name
                     )
                 )
 
-            # --------------------------------------------
-            # START OF TRADITIONAL FUZZING CAMPAIGN
-            # --------------------------------------------
+            # ==========================================
+            # TRADITIONAL MODBUS FUZZING
+            # ==========================================
 
             sample("before")
 
             for target in ("inlet", "device"):
-
                 cases = modbus_cases(
-                    target,
-                    args.per_node,
-                    rng
+                    target, args.per_node, rng
                 )
 
                 print(
@@ -929,13 +1006,29 @@ def run_campaign(args):
 
                 for offset, case in enumerate(cases, 1):
 
+                    # Selected tests for paired measurements.
+                    paired = case["case_name"] in (
+                        "unit_zero",
+                        "unit_255",
+                        "length_too_small",
+                        "length_too_large",
+                        "unsupported_function",
+                    )
+
+                    # Measure before the unusual request.
+                    if paired:
+                        paired_measure(
+                            "before",
+                            target,
+                            case["case_name"]
+                        )
+
+                    # Send the actual fuzzing request.
                     answer = worker.request(
-                        "fuzz",
-                        case=case
+                        "fuzz", case=case
                     )
 
                     data = answer["data"]
-
                     result = data["result"]
 
                     counters[(target, result)] += 1
@@ -957,7 +1050,6 @@ def run_campaign(args):
                     ):
                         review.append("review_modbus_response")
 
-                    # Protocol rejection can be expected for malformed MBAP.
                     if (
                         case["function"] in (3, 4)
                         and case.get("proto", 0) == 0
@@ -998,16 +1090,21 @@ def run_campaign(args):
                         response_hex=data.get(
                             "response_hex", ""
                         ),
-                        review_flags=review,
+                        review_flags=review
                     )
 
                     for flag in review:
                         flags_found[flag] += 1
 
-                    # ------------------------------------
-                    # NEW: RUN RECOVERY TEST WHEN NEEDED
-                    # ------------------------------------
+                    # V3B: Measure immediately afterward.
+                    if paired:
+                        paired_measure(
+                            "after",
+                            target,
+                            case["case_name"]
+                        )
 
+                    # V2: Check recovery after unusual replies.
                     if result in (
                         "timeout",
                         "connection_closed",
@@ -1030,18 +1127,16 @@ def run_campaign(args):
 
                 sample("after_%s" % target)
 
-            # --------------------------------------------
+            # ==========================================
             # HMI HTTP FUZZING
-            # --------------------------------------------
+            # ==========================================
 
             print(
                 "HMI node: HTTP GET mutation campaign"
             )
 
             for case_id, path, family in hmi_cases(paths):
-
                 answer = read_hmi(path)
-
                 status = answer["http_status"]
 
                 result = (
@@ -1091,13 +1186,14 @@ def run_campaign(args):
 
             sample("after_hmi")
 
-            # --------------------------------------------
-            # OPTIONAL WRITE EXPERIMENT
-            # --------------------------------------------
+            # ==========================================
+            # OPTIONAL CONTROLLED WRITE EXPERIMENT
+            # ==========================================
 
             if args.enable_write_experiment:
                 print(
-                    "OPT-IN: bounded FC06 tests on two simulated devices"
+                    "OPT-IN: bounded FC06 tests "
+                    "on two simulated devices"
                 )
 
                 injections = (
@@ -1108,7 +1204,6 @@ def run_campaign(args):
                 )
 
                 for target, value in injections:
-
                     case = {
                         "target": target,
                         "function": 6,
@@ -1118,13 +1213,12 @@ def run_campaign(args):
                     }
 
                     answer = worker.request(
-                        "fuzz",
-                        case=case
+                        "fuzz", case=case
                     )["data"]
 
-                    counters[
-                        (target, answer["result"])
-                    ] += 1
+                    counters[(
+                        target, answer["result"]
+                    )] += 1
 
                     record_csv(
                         writer,
@@ -1162,9 +1256,9 @@ def run_campaign(args):
 
                 sample("after_optional_writes")
 
-            # --------------------------------------------
-            # FINAL MONITORING AND RESTART CHECK
-            # --------------------------------------------
+            # ==========================================
+            # FINAL SYSTEM HEALTH CHECK
+            # ==========================================
 
             sample("final")
 
@@ -1174,7 +1268,6 @@ def run_campaign(args):
             }
 
             for svc in LAB_SERVICES:
-
                 before = restart_before.get(svc)
                 after = restart_after.get(svc)
 
@@ -1222,9 +1315,7 @@ def run_campaign(args):
             )
         )
 
-        return round(
-            ordered[index], 2
-        )
+        return round(ordered[index], 2)
 
     summary = {
         "run_id": run_id,
@@ -1383,8 +1474,7 @@ def main():
         subprocess.SubprocessError
     ) as exc:
         print(
-            "ERROR:",
-            exc,
+            "ERROR:", exc,
             file=sys.stderr
         )
         return 1
